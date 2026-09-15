@@ -11,22 +11,22 @@ contest.
 
 BOUNTY LIFECYCLE:
 
-  1. Poster creates a bounty with description, reward, and deadline.
-  2. Worker signs a message of bounty_id and submits proof (URL + description).
-  3. Contract verifies the worker's signature on-chain (pure-Python secp256k1
+  1. Poster creates a bounty with description and deadline.
+  2. Poster funds the bounty by sending GEN (payable).
+  3. Worker signs {bounty_id}:{proof_url}:{nonce} (EIP-191) and submits proof.
+  4. Contract verifies the worker's signature on-chain (pure-Python secp256k1
      ecrecover) — the recovered signer MUST equal the submitting wallet.
-  4. Contract fetches the proof URL and, under consensus, an LLM translates
+  5. Contract fetches the proof URL and, under consensus, an LLM translates
      bounty requirements into boolean expressions evaluated in an AST sandbox
      (ground truth), then a judge decides whether the work satisfies the bounty.
-  5. If approved, the worker receives the reward; if rejected, the worker gets
-     nothing and can resubmit (rate-limited).
-
-Only after consensus approval does the reward transfer happen. The verdict
-cannot be forged: the proof URL must embed the worker's signature (provenance),
-and the LLM cannot override a VIOLATED programmatic check.
+  6. If approved, the worker can claim the reward (GEN transfer).
+  7. If rejected, the worker gets nothing and can resubmit (rate-limited).
+  8. After deadline, anyone can expire open/rejected bounties — funds return
+     to the poster.
+  9. Poster can cancel before any submission — funds return to the poster.
 
 Hardening: AST sandbox, prompt-injection resistance, SSRF blocklist, anti-replay
-(seq bound into signature), rate-limit submissions (1 per worker per bounty),
+(nonce bound into signature), rate-limit submissions (1 per worker per bounty),
 deadline enforcement, no self-approval.
 """
 
@@ -85,6 +85,17 @@ ALLOWED_TEXT_METHODS = frozenset(
     }
 )
 
+ALLOWED_NONCE_METHODS = frozenset({"len", "startswith", "endswith"})
+
+
+@gl.evm.contract_interface
+class _Recipient:
+    class View:
+        pass
+
+    class Write:
+        pass
+
 
 def _now_ts() -> int:
     try:
@@ -110,11 +121,13 @@ class Bounty:
     id: str
     poster: Address
     description: str
-    reward: u256
+    reward: u256  # total claimed reward amount (set on claim)
+    funded: u256  # actual GEN deposited
     deadline: u256
     worker: str  # hex addr (empty string if unclaimed)
-    status: str  # open, submitted, approved, rejected, expired
+    status: str  # open, submitted, approved, rejected, expired, cancelled, claimed
     created_ts: u256
+    claimed: bool
 
 
 @allow_storage
@@ -125,6 +138,7 @@ class Submission:
     worker: Address
     proof_url: str
     signature: str
+    nonce: u256
     approved: bool
     reasoning: str
     submitted_ts: u256
@@ -506,6 +520,7 @@ class BountyBoard(gl.Contract):
     bounties: TreeMap[str, Bounty]
     submissions: TreeMap[str, Submission]
     counters: TreeMap[str, u256]  # "{bounty_id}:{worker}" -> submission count
+    nonces: TreeMap[str, u256]  # "{bounty_id}:{worker}" -> nonce
     bounty_order: DynArray[str]
 
     def __init__(self):
@@ -531,23 +546,26 @@ class BountyBoard(gl.Contract):
             poster=sender,
             description=description,
             reward=0,
+            funded=0,
             deadline=deadline_ts,
             worker="",
             status="open",
             created_ts=_now_ts(),
+            claimed=False,
         )
         self.bounty_order.append(bounty_id)
 
-    @gl.public.write
-    def fund_bounty(self, bounty_id: str, amount: int) -> None:
+    @gl.public.write.payable
+    def fund_bounty(self, bounty_id: str) -> None:
         if bounty_id not in self.bounties:
             raise gl.vm.UserError("bounty not found")
         bounty = self.bounties[bounty_id]
-        if bounty.status != "open":
-            raise gl.vm.UserError("bounty is not open")
-        if amount <= 0:
-            raise gl.vm.UserError("amount must be positive")
-        bounty.reward = int(bounty.reward) + amount
+        if bounty.status not in ("open", "rejected"):
+            raise gl.vm.UserError("bounty is not fundable in current state")
+        value = gl.message.value
+        if value == u256(0):
+            raise gl.vm.UserError("must send GEN to fund")
+        bounty.funded = u256(int(bounty.funded) + int(value))
         self.bounties[bounty_id] = bounty
 
     @gl.public.write
@@ -559,6 +577,8 @@ class BountyBoard(gl.Contract):
             raise gl.vm.UserError("bounty is not open for submissions")
         if _now_ts() > int(bounty.deadline):
             raise gl.vm.UserError("bounty deadline has passed")
+        if int(bounty.funded) == 0:
+            raise gl.vm.UserError("bounty has no funding")
         if not _validate_url(proof_url):
             raise gl.vm.UserError("proof_url must be an http(s) URL (internal hosts blocked)")
         if not signature or len(signature) > MAX_SIGNATURE_CHARS or not SIG_RE.match(signature):
@@ -568,12 +588,14 @@ class BountyBoard(gl.Contract):
         if _addr_eq(sender, bounty.poster):
             raise gl.vm.UserError("poster cannot submit work for own bounty")
 
-        sign_msg = f"{bounty_id}:{proof_url}"
+        counter_key = f"{bounty_id}:{_addr_hex(sender)}"
+        nonce = int(self.nonces.get(counter_key, 0))
+
+        sign_msg = f"{bounty_id}:{proof_url}:{nonce}"
         signer = _signer_of(sign_msg, signature)
         if signer is None or signer != _addr_hex(sender):
             raise gl.vm.UserError("Signature does not match the submitting wallet")
 
-        counter_key = f"{bounty_id}:{_addr_hex(sender)}"
         count = int(self.counters.get(counter_key, 0))
         if count > 0:
             submission_id = f"{bounty_id}:{_addr_hex(sender)}:{count}"
@@ -596,11 +618,13 @@ class BountyBoard(gl.Contract):
             worker=sender,
             proof_url=proof_url,
             signature=signature,
+            nonce=nonce,
             approved=result["approved"],
             reasoning=result["reasoning"],
             submitted_ts=_now_ts(),
         )
         self.counters[counter_key] = n
+        self.nonces[counter_key] = nonce + 1
 
         if result["approved"]:
             bounty.worker = _addr_hex(sender)
@@ -608,6 +632,30 @@ class BountyBoard(gl.Contract):
         elif bounty.status == "rejected":
             bounty.status = "open"
         self.bounties[bounty_id] = bounty
+
+    @gl.public.write
+    def claim_reward(self, bounty_id: str) -> None:
+        if bounty_id not in self.bounties:
+            raise gl.vm.UserError("bounty not found")
+        bounty = self.bounties[bounty_id]
+        if bounty.claimed:
+            raise gl.vm.UserError("reward already claimed")
+        if bounty.status != "approved":
+            raise gl.vm.UserError("bounty is not approved")
+        if int(bounty.funded) == 0:
+            raise gl.vm.UserError("no funds to claim")
+
+        sender = gl.message.sender_address
+        if _addr_hex(sender) != bounty.worker:
+            raise gl.vm.UserError("only the approved worker can claim")
+
+        amount = bounty.funded
+        bounty.claimed = True
+        bounty.status = "claimed"
+        bounty.reward = amount
+        self.bounties[bounty_id] = bounty
+
+        _Recipient(sender).emit_transfer(value=u256(amount), on="finalized")
 
     @gl.public.write
     def reject_submission(self, bounty_id: str, worker_addr: str) -> None:
@@ -626,6 +674,28 @@ class BountyBoard(gl.Contract):
         self.bounties[bounty_id] = bounty
 
     @gl.public.write
+    def cancel_bounty(self, bounty_id: str) -> None:
+        if bounty_id not in self.bounties:
+            raise gl.vm.UserError("bounty not found")
+        bounty = self.bounties[bounty_id]
+        sender = gl.message.sender_address
+        if not _addr_eq(sender, bounty.poster):
+            raise gl.vm.UserError("only poster can cancel")
+        if bounty.status not in ("open",):
+            raise gl.vm.UserError("can only cancel open bounties with no submissions")
+        if int(bounty.funded) == 0:
+            bounty.status = "cancelled"
+            self.bounties[bounty_id] = bounty
+            return
+
+        refund = bounty.funded
+        bounty.funded = 0
+        bounty.status = "cancelled"
+        self.bounties[bounty_id] = bounty
+
+        _Recipient(sender).emit_transfer(value=u256(refund), on="finalized")
+
+    @gl.public.write
     def expire_bounty(self, bounty_id: str) -> None:
         if bounty_id not in self.bounties:
             raise gl.vm.UserError("bounty not found")
@@ -634,8 +704,17 @@ class BountyBoard(gl.Contract):
             raise gl.vm.UserError("bounty cannot be expired in current state")
         if _now_ts() <= int(bounty.deadline):
             raise gl.vm.UserError("deadline has not passed yet")
+
+        poster = bounty.poster
         bounty.status = "expired"
-        self.bounties[bounty_id] = bounty
+
+        if int(bounty.funded) > 0:
+            refund = bounty.funded
+            bounty.funded = 0
+            self.bounties[bounty_id] = bounty
+            _Recipient(poster).emit_transfer(value=u256(refund), on="finalized")
+        else:
+            self.bounties[bounty_id] = bounty
 
     @gl.public.view
     def get_bounty(self, bounty_id: str) -> dict:
@@ -647,10 +726,12 @@ class BountyBoard(gl.Contract):
             "poster": _addr_hex(b.poster),
             "description": b.description,
             "reward": b.reward,
+            "funded": b.funded,
             "deadline": b.deadline,
             "worker": b.worker,
             "status": b.status,
             "created_ts": b.created_ts,
+            "claimed": b.claimed,
         }
 
     @gl.public.view
@@ -666,8 +747,14 @@ class BountyBoard(gl.Contract):
             "approved": s.approved,
             "reasoning": s.reasoning,
             "signature": s.signature,
+            "nonce": s.nonce,
             "submitted_ts": s.submitted_ts,
         }
+
+    @gl.public.view
+    def get_nonce(self, bounty_id: str, worker_addr: str) -> int:
+        counter_key = f"{bounty_id}:{worker_addr.lower().replace('0x', '')}"
+        return int(self.nonces.get(counter_key, 0))
 
     @gl.public.view
     def get_contract_stats(self) -> dict:
