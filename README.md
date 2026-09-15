@@ -10,7 +10,7 @@
 [![GenLayer](https://img.shields.io/badge/Built%20on-GenLayer-6366f1?style=for-the-badge&logo=genlayer)](https://genlayer.com)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Equivalence](https://img.shields.io/badge/Equivalence%20Principle-OK-16a34a?style=for-the-badge)](https://docs.genlayer.com/developers/intelligent-contracts/equivalence-principle)
-[![Tests](https://img.shields.io/badge/tests-15%20passed-16a34a?style=for-the-badge)]()
+[![Tests](https://img.shields.io/badge/tests-25%20passed-16a34a?style=for-the-badge)]()
 
 ---
 
@@ -29,14 +29,13 @@
 
 ## Deployed contract (proof on explorer)
 
-- **Contract address:** `0xb176Df4a6F55245351D29123710C4Ac1D9AF8882`
-- **Explorer:** [explorer-studio.genlayer.com/address/0xb176Df4a6F55245351D29123710C4Ac1D9AF8882](https://explorer-studio.genlayer.com/address/0xb176Df4a6F55245351D29123710C4Ac1D9AF8882)
+- **Contract address:** `0x8FD53de0764b1238Ef59c417B0369b5207315b52`
+- **Explorer:** [explorer-studio.genlayer.com/address/0x8FD53de0764b1238Ef59c417B0369b5207315b52](https://explorer-studio.genlayer.com/address/0x8FD53de0764b1238Ef59c417B0369b5207315b52)
 
-Verified live on studionet: input validation (empty bounty_id, bad description,
-past deadline, duplicate bounty) all rejected with correct errors. Forged
-signatures from a different wallet rejected on-chain via ecrecover. Self-
-submission (poster submitting own work) rejected. All views return consistent
-state. 13 GenVM direct-mode tests pass, genvm-lint passes.
+Verified live on studionet: create bounty, fund with GEN (payable), submit work
+with nonce-bound signature, claim reward (GEN transfer to worker), cancel with
+refund, expire with refund. All views return consistent state. 25 GenVM
+direct-mode tests pass, genvm-lint passes.
 
 ---
 
@@ -165,6 +164,9 @@ expired       expired          expired
 | **Unauthorized rejection** | `reject_submission` requires `sender == poster` |
 | **Resubmission after reject** | Rejected bounties return to open; worker can resubmit with rate limit |
 | **SSRF expanded** | Blocklist includes `::1`, `169.254.169.254`, `metadata.*.internal`, `.localhost` |
+| **Real custody** | `fund_bounty` accepts GEN via `msg.value`; `claim_reward` transfers via `emit_transfer` |
+| **Refund on cancel/expire** | Poster receives GEN refund on cancel or expiry |
+| **Nonce-bound signatures** | `{bounty_id}:{proof_url}:{nonce}` prevents signature replay |
 
 ---
 
@@ -178,25 +180,35 @@ genvm-lint check contracts/bounty_board.py
 pytest tests/bounty_board_test.py -v
 ```
 
-**Test coverage (15 tests):**
+**Test coverage (25 tests):**
 
 | # | Test | What it verifies |
 |---|------|------------------|
-| 1 | `test_create_and_fund_bounty` | Create + fund lifecycle |
-| 2 | `test_rejects_bad_bounty_id` | Empty/long bounty_id rejected |
-| 3 | `test_rejects_bad_description` | Empty description rejected |
-| 4 | `test_rejects_past_deadline` | Past deadline rejected |
-| 5 | `test_rejects_duplicate_bounty` | Duplicate bounty_id rejected |
-| 6 | `test_rejects_forged_signature` | Wrong wallet signature rejected |
-| 7 | `test_rejects_self_submission` | Poster cannot submit own work |
-| 8 | `test_submit_and_approve` | Positive path: submit + approve |
-| 9 | `test_rejects_no_signature_in_page` | Judge rejects insufficient proof |
-| 10 | `test_rejects_after_deadline` | Post-deadline submission rejected |
-| 11 | `test_views_consistent` | Views return consistent state |
-| 12 | `test_expire_bounty` | Expire after deadline |
-| 13 | `test_reject_submission` | Reject approved submission |
-| 14 | `test_get_bounty_submissions` | List submissions per bounty |
-| 15 | `test_resubmit_after_rejection` | Resubmit after rejection (rate-limited) |
+| 1 | `test_create_and_fund_bounty` | Create + fund lifecycle (payable) |
+| 2 | `test_fund_requires_value` | Fund without GEN rejected |
+| 3 | `test_cannot_fund_after_submission` | Cannot fund after submission |
+| 4 | `test_rejects_bad_bounty_id` | Empty/long bounty_id rejected |
+| 5 | `test_rejects_bad_description` | Empty description rejected |
+| 6 | `test_rejects_past_deadline` | Past deadline rejected |
+| 7 | `test_rejects_duplicate_bounty` | Duplicate bounty_id rejected |
+| 8 | `test_rejects_forged_signature` | Wrong wallet signature rejected |
+| 9 | `test_rejects_self_submission` | Poster cannot submit own work |
+| 10 | `test_submit_and_approve` | Positive path: submit + approve |
+| 11 | `test_rejects_no_signature_in_page` | Judge rejects insufficient proof |
+| 12 | `test_rejects_after_deadline` | Post-deadline submission rejected |
+| 13 | `test_claim_reward` | Claim GEN payout after approval |
+| 14 | `test_claim_requires_approved` | Cannot claim unapproved bounty |
+| 15 | `test_claim_requires_worker` | Non-worker cannot claim |
+| 16 | `test_claim_double_claim` | Double claim rejected |
+| 17 | `test_cancel_bounty_refunds` | Cancel refunds poster |
+| 18 | `test_cancel_requires_poster` | Non-poster cannot cancel |
+| 19 | `test_cancel_only_open` | Cannot cancel after submission |
+| 20 | `test_expire_bounty_refunds` | Expire refunds poster |
+| 21 | `test_expire_bounty_no_fund` | Expire without funding |
+| 22 | `test_nonce_prevents_replay` | Nonce prevents signature replay |
+| 23 | `test_reject_submission` | Reject approved submission |
+| 24 | `test_views_consistent` | Views return consistent state |
+| 25 | `test_get_bounty_submissions` | List submissions per bounty |
 
 ---
 
